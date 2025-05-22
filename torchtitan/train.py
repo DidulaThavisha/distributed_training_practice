@@ -159,7 +159,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         color = self.metrics_processor.color
 
         # calculate model size and flops per token
-        (model_param_count, self.metrics_processor.num_flops_per_token) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
+        (
+            model_param_count,
+            self.metrics_processor.num_flops_per_token,
+        ) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
 
         logger.info(
             f"{color.blue}Model {self.train_spec.name} {job_config.model.flavor} "
@@ -299,9 +302,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         device_type = utils.device_type
-        # for k, _ in input_dict.item():
-        #     input_dict[k] = input_dict[k].to(device_type)
-        input_dict = input_dict.to(device_type)
+        for k, _ in input_dict.items():
+            input_dict[k] = input_dict[k].to(device_type)
         labels = labels.to(device_type)
         return input_dict, labels
 
@@ -410,7 +412,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             optimizer=self.optimizers,
             sync_every=job_config.fault_tolerance.sync_steps,
         ):
-            data_iterator = self.dataloader.dataset.get_batch_iterator()
+            data_iterator = iter(self.dataloader)
             while self.step < job_config.training.steps:
                 self.step += 1
                 self.gc_handler.run(self.step)

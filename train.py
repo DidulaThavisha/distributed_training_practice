@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-from typing import Optional
+from typing import Optional, Iterable
+import time
+from datetime import timedelta
 
 import torch
 
@@ -13,6 +15,14 @@ from torchtitan.config_manager import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.train import Trainer
+from torchtitan.tools.profiling import (
+    maybe_enable_memory_snapshot,
+    maybe_enable_profiling,
+)
+import torchtitan.components.ft as ft
+from torchtitan.tools import utils
+
+
 
 
 
@@ -35,7 +45,9 @@ from src.models.transformer import Transformer
 
 class LLMTrainer(Trainer):
     def __init__(self, job_config: JobConfig):
-        super().__init__(job_config)
+        super().__init__(
+            job_config
+        )
 
         # Set random seed, and maybe enable deterministic mode
         # (mainly for debugging, expect perf loss).
@@ -184,6 +196,72 @@ class LLMTrainer(Trainer):
             model.eval()
             self.eval_step()
             model.train()
+
+    def next_batch(
+        self, data_iterator: Iterable
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        data_load_start = time.perf_counter()
+        batch = next(data_iterator)
+        input_dict, labels = batch
+        self.metrics_processor.ntokens_since_last_log += labels.numel()
+        self.metrics_processor.data_loading_times.append(
+            time.perf_counter() - data_load_start
+        )
+
+        device_type = utils.device_type
+        input_dict = input_dict.to(device_type)
+        labels = labels.to(device_type)
+        return input_dict, labels
+
+    def train(self):
+        job_config = self.job_config
+
+        self.checkpointer.load(step=job_config.checkpoint.load_step)
+        logger.info(f"Training starts at step {self.step + 1}.")
+
+        with maybe_enable_profiling(
+            job_config, global_step=self.step
+        ) as torch_profiler, maybe_enable_memory_snapshot(
+            job_config, global_step=self.step
+        ) as memory_profiler, ft.maybe_semi_sync_training(
+            job_config,
+            ft_manager=self.ft_manager,
+            model=self.model_parts[0],
+            optimizer=self.optimizers,
+            sync_every=job_config.fault_tolerance.sync_steps,
+        ):
+            data_iterator = iter(self.dataloader.dataset.get_batch_iterator())
+            while self.step < job_config.training.steps:
+                self.step += 1
+                self.gc_handler.run(self.step)
+                inputs, labels = self.next_batch(data_iterator)
+                self.train_step(inputs, labels)
+                self.checkpointer.save(
+                    self.step, force=(self.step == job_config.training.steps)
+                )
+
+                # signal the profiler that the next profiling step has started
+                if torch_profiler:
+                    torch_profiler.step()
+                if memory_profiler:
+                    memory_profiler.step()
+
+                # reduce timeout after first train step for faster signal
+                # (assuming lazy init and compilation are finished)
+                if self.step == 1:
+                    dist_utils.set_pg_timeouts(
+                        timeout=timedelta(
+                            seconds=job_config.comm.train_timeout_seconds
+                        ),
+                        world_mesh=self.world_mesh,
+                    )
+
+        if torch.distributed.get_rank() == 0:
+            logger.info("Sleeping 2 seconds for other ranks to complete")
+            time.sleep(2)
+
+        self.metrics_processor.close()
+        logger.info("Training completed")
 
     def eval_step(self, prompt: str = "A photo of a cat"):
         """
